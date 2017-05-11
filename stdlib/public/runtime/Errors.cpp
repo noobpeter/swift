@@ -56,8 +56,6 @@ enum: uint32_t {
 
 using namespace swift;
 
-#if SWIFT_RUNTIME_ENABLE_BACKTRACE_REPORTING
-
 static bool getSymbolNameAddr(llvm::StringRef libraryName, SymbolInfo syminfo,
                               std::string &symbolName, uintptr_t &addrOut) {
 
@@ -96,9 +94,8 @@ static bool getSymbolNameAddr(llvm::StringRef libraryName, SymbolInfo syminfo,
   return true;
 }
 
-/// This function dumps one line of a stack trace. It is assumed that \p address
-/// is the address of the stack frame at index \p index.
-static void dumpStackTraceEntry(unsigned index, void *framePC) {
+void swift::dumpStackTraceEntry(unsigned index, void *framePC,
+                                bool shortOutput) {
   SymbolInfo syminfo;
 
   // 0 is failure for lookupSymbol
@@ -118,6 +115,14 @@ static void dumpStackTraceEntry(unsigned index, void *framePC) {
   uintptr_t symbolAddr = uintptr_t(framePC);
   bool foundSymbol =
       getSymbolNameAddr(libraryName, syminfo, symbolName, symbolAddr);
+  ptrdiff_t offset = 0;
+  if (foundSymbol) {
+    offset = ptrdiff_t(uintptr_t(framePC) - symbolAddr);
+  } else {
+    offset = ptrdiff_t(uintptr_t(framePC) - uintptr_t(syminfo.baseAddress));
+    symbolAddr = uintptr_t(framePC);
+    symbolName = "<unavailable>";
+  }
 
   // We do not use %p here for our pointers since the format is implementation
   // defined. This makes it logically impossible to check the output. Forcing
@@ -126,20 +131,15 @@ static void dumpStackTraceEntry(unsigned index, void *framePC) {
   // from the base address of where the image containing framePC is mapped.
   // This gives enough info to reconstruct identical debugging target after
   // this process terminates.
-  if (foundSymbol) {
-    static const char *backtraceEntryFormat = "%-4u %-34s 0x%0.16lx %s + %td\n";
-    fprintf(stderr, backtraceEntryFormat, index, libraryName.data(), symbolAddr,
-            symbolName.c_str(), ptrdiff_t(uintptr_t(framePC) - symbolAddr));
+  if (shortOutput) {
+    fprintf(stderr, "%s`%s + %td", libraryName.data(), symbolName.c_str(),
+            offset);
   } else {
-    static const char *backtraceEntryFormat = "%-4u %-34s 0x%0.16lx "
-                                              "<unavailable> + %td\n";
-    fprintf(stderr, backtraceEntryFormat, index, libraryName.data(),
-            uintptr_t(framePC),
-            ptrdiff_t(uintptr_t(framePC) - uintptr_t(syminfo.baseAddress)));
+    constexpr const char *format = "%-4u %-34s 0x%0.16lx %s + %td\n";
+    fprintf(stderr, format, index, libraryName.data(), symbolAddr,
+            symbolName.c_str(), offset);
   }
 }
-
-#endif
 
 #ifdef SWIFT_HAVE_CRASHREPORTERCLIENT
 #include <malloc/malloc.h>

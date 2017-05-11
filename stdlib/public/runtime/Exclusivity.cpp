@@ -53,6 +53,13 @@
 #define get_return_address() ((void*) 0)
 #endif
 
+// We need backtrace() here even when SWIFT_RUNTIME_ENABLE_BACKTRACE_REPORTING=0
+#if defined(__CYGWIN__) || defined(__ANDROID__) || defined(_WIN32)
+#define EXCLUSIVITY_SUPPORTS_BACKTRACE 0
+#else
+#define EXCLUSIVITY_SUPPORTS_BACKTRACE 1
+#include <execinfo.h>
+#endif
 
 using namespace swift;
 
@@ -61,38 +68,66 @@ bool swift::_swift_disableExclusivityChecking = false;
 static const char *getAccessName(ExclusivityFlags flags) {
   switch (flags) {
   case ExclusivityFlags::Read: return "read";
-  case ExclusivityFlags::Modify: return "modify";
+  case ExclusivityFlags::Modify: return "modification";
   default: return "unknown";
   }
 }
 
+LLVM_ATTRIBUTE_ALWAYS_INLINE
+static void printConflictDetails(const char *oldAccessName, void *oldPC,
+                                 const char *newAccessName, void *newPC) {
+#if EXCLUSIVITY_SUPPORTS_BACKTRACE
+  fprintf(stderr, "Previous access (a %s) started at ", oldAccessName);
+  if (oldPC) {
+    dumpStackTraceEntry(0, oldPC, /*shortOutput=*/true);
+    fprintf(stderr, " (0x%lx).\n", (uintptr_t)oldPC);
+  } else {
+    fprintf(stderr, "<unknown>.\n");
+  }
+
+  fprintf(stderr, "Current access (a %s) started at:\n", newAccessName);
+  // The top frame is in swift_beginAccess, don't print it.
+  constexpr unsigned framesToSkip = 1;
+  constexpr unsigned maxSupportedStackDepth = 128;
+  void *addrs[maxSupportedStackDepth];
+  int symbolCount = backtrace(addrs, maxSupportedStackDepth);
+  for (int i = framesToSkip; i < symbolCount; ++i) {
+    dumpStackTraceEntry(i - framesToSkip, addrs[i]);
+  }
+#else
+  fprintf(stderr, "Previous access (%s) started at 0x%lx.\n", oldAccessName,
+          (uintptr_t)oldPC);
+  fprintf(stderr, "Current access (%s) started at 0x%lx.\n", newAccessName,
+          (uintptr_t)newPC);
+#endif
+}
+
+LLVM_ATTRIBUTE_ALWAYS_INLINE
 static void reportExclusivityConflict(ExclusivityFlags oldAction, void *oldPC,
                                       ExclusivityFlags newFlags, void *newPC,
                                       void *pointer) {
-  // TODO: print something about where the pointer came from?
-  // TODO: if we do something more computationally intense here,
-  //   suppress warnings if the total warning count exceeds some limit
-
-  if (isWarningOnly(newFlags)) {
-    fprintf(stderr,
-            "WARNING: %s/%s access conflict detected on address %p\n"
-            "  first access started at PC=%p\n"
-            "  second access started at PC=%p\n",
-            getAccessName(oldAction),
-            getAccessName(getAccessAction(newFlags)),
-            pointer, oldPC, newPC);
+  static std::atomic<long> reportedConflicts{0};
+  constexpr unsigned maxReportedConflicts = 100;
+  // Don't report more that 100 conflicts. Hopefully, this will improve
+  // performance in case there are conflicts inside a tight loop.
+  if (reportedConflicts.fetch_add(1, std::memory_order_relaxed) >=
+      maxReportedConflicts) {
     return;
   }
 
-  // TODO: try to recover source-location information from the return
-  // address.
-  fatalError(0,
-             "%s/%s access conflict detected on address %p, aborting\n"
-             "  first access started at PC=%p\n"
-             "  second access started at PC=%p\n",
-             getAccessName(oldAction),
-             getAccessName(getAccessAction(newFlags)),
-             pointer, oldPC, newPC);
+  fprintf(stderr,
+          "Simultaneous accesses to 0x%lx, but modification requires exclusive "
+          "access.\n",
+          (uintptr_t)pointer);
+  printConflictDetails(getAccessName(oldAction), oldPC,
+                       getAccessName(getAccessAction(newFlags)), newPC);
+
+  if (isWarningOnly(newFlags)) {
+    return;
+  }
+
+  // 0 means no backtrace will be printed.
+  fatalError(0, "Fatal access conflict detected.\n");
 }
 
 namespace {
